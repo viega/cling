@@ -60,13 +60,6 @@
 #define GCM_PID_IX      1
 #define GCM_MSG_CTR_IX  2
 
-// The first 64 bits of the IV are data supplied by the sender, and
-// must be used by the recipient to decrypt.  We call this the
-// "noncelet" (the IV is technically a nonce itself, and this is a
-// one-time value that is part of the IV).  We store the noncelet as a
-// byte array, and use NONCELET_LEN to indicate the length in bytes.
-#define NONCELET_LEN    8
-
 // The message counter is stored in a 32 bit word, but is only
 // a 24-bit value.  The rest of the word/half word is reserved for
 // flags that indicate the sending context (e.g., if the client
@@ -130,6 +123,15 @@ typedef struct {
   } u;
 } gcm_iv_t;
 
+// These macros assume you're operating on an object of type
+// gcm_iv_t, not a reference to an object.  We do this because
+// IVs are embedded in gcm_ctx and gcm_str, and so we'll be
+// holding a pointer to those objects; nothing will be holding
+// pointers to IVs.
+#define IV_GET_CTR_WORD(iv)    (ntohl((iv).u.ints[GCM_MSG_CTR_IX]))
+#define IV_SET_CTR_WORD(iv, c) ((iv).u.ints[GCM_MSG_CTR_IX] = htonl(c))
+#define IV_GET_ORIGIN(iv)      (IV_GET_CTR_WORD(iv) & F_SERVER_ORIGIN)
+
 // This context object holds all the state associated with a single
 // symmetric encryption session.  It contains references to the file
 // descriptors in use to talk to the kernel, and information about
@@ -168,8 +170,7 @@ typedef struct {
   
   uint32_t msg_length;  // length of the plaintext/ciphertext.
   uint32_t tag_length;  // Either 16 or 0; 16 if it's ct, 0 if it's plaintext.
-  uint8_t  noncelet[NONCELET_LEN];  // The random nonce from the message.
-  uint32_t counter_word; // The last 32-bits of IV in host byte order (when decrypting)
+  gcm_iv_t iv;          // Initialization Vector used for this message.
   uint32_t aad_length;
   bool     plaintext;
   struct   iovec *iov;
@@ -235,11 +236,14 @@ gcm_init_ivs(gcm_ctx *ctx, int role) {
   ctx->decr_iv.ivlen = GCM_IV_LEN;
   // Set the flag indicating which nonce is for server-originated
   // messages.  This flag is in the most significant byte of the final
-  // 32 bits, which is otherwise occupied by the message counter.
+  // 32 bits, which is otherwise occupied by the message counter,
+  // which starts out at 0.
   if (role == ROLE_CLIENT) {
-    ctx->encr_iv.u.ints[GCM_MSG_CTR_IX] = htonl(F_SERVER_ORIGIN);
+    IV_SET_CTR_WORD(ctx->encr_iv, F_CLIENT_ORIGIN);
+    IV_SET_CTR_WORD(ctx->decr_iv, F_SERVER_ORIGIN);
   } else {
-    ctx->encr_iv.u.ints[GCM_MSG_CTR_IX] = htonl(F_SERVER_ORIGIN);
+    IV_SET_CTR_WORD(ctx->encr_iv, F_SERVER_ORIGIN);
+    IV_SET_CTR_WORD(ctx->decr_iv, F_CLIENT_ORIGIN);
   }
 }
 
@@ -348,19 +352,11 @@ gcm_send_kernel_msg(gcm_ctx *ctx, gcm_str *in, gcm_str *out,
   // We can't just reference a cmsg_data field, it needs to be computed.
   *(uint32_t *)CMSG_DATA(header) = operation;
 
-  // TODO-- redo the way the nonce is stored in gcm_str.
-  // this is temporary.
-  gcm_iv_t iv;
-
-  iv.ivlen = 12;
-  memcpy((void *)iv.u.bytes, in->noncelet, sizeof(in->noncelet));
-  iv.u.ints[2] = in->counter_word;
-  
   header                         = CMSG_NXTHDR(&msg, header);
   header->cmsg_level             = SOL_ALG;
   header->cmsg_type              = ALG_SET_IV;
   header->cmsg_len               = CMSG_SPACE(sizeof(gcm_iv_t));
-  memcpy(CMSG_DATA(header), &iv, sizeof(gcm_iv_t));
+  memcpy(CMSG_DATA(header), &in->iv, sizeof(gcm_iv_t));
 
   // This needs to be sent, even if there is no AAD.
   header                         = CMSG_NXTHDR(&msg, header);
@@ -485,18 +481,22 @@ gcm_encrypt(gcm_ctx *ctx, gcm_str *in, gcm_str *out, int *error) {
   ctx->encr_iv.u.ints[GCM_HPT_IX] ^= nanoseconds;
   ctx->encr_iv.u.ints[GCM_PID_IX] ^= getpid();
 
-  memcpy(out->noncelet, ctx->encr_iv.u.bytes, NONCELET_LEN);
+  // We store the nonce in both the input and output strings.
+  // gcm_send_kernel_msg() looks for it in the input.
+  memcpy(&in->iv,  &ctx->encr_iv,  sizeof(gcm_iv_t));  
+  memcpy(&out->iv, &ctx->encr_iv, sizeof(gcm_iv_t));
 
   if (!gcm_send_kernel_msg(ctx, in, out, ALG_OP_ENCRYPT, error)) {
     return false;
   }
 
-  // Finally, increment the sender nonce.
-  uint32_t counter_word = ntohl(ctx->encr_iv.u.ints[GCM_MSG_CTR_IX]) + 1;
+  // Finally, increment the sender nonce in the context object,
+  // prepping it for the next message.
+  uint32_t counter_word = IV_GET_CTR_WORD(ctx->encr_iv) + 1;
   if ((counter_word & MASK_CTR) >= MAX_MESSAGES) {
     ctx->encrypt_limit = true;
   }
-  ctx->encr_iv.u.ints[GCM_MSG_CTR_IX] = htonl(counter_word);
+  IV_SET_CTR_WORD(ctx->encr_iv, counter_word);
   return true;
 }
 
@@ -511,9 +511,9 @@ gcm_decrypt(gcm_ctx *ctx, gcm_str *in, gcm_str *out, int *error) {
 
   // Counter received in IV w/ plaintext.  Note that both of these
   // should be directly comparable, already in host byte order.
-  uint32_t rcv_ctr  = in->counter_word & MASK_CTR;
+  uint32_t rcv_ctr  = IV_GET_CTR_WORD(in->iv)       & MASK_CTR;
   // The minimum acceptable counter value, based on last decrypted msg.
-  uint32_t min_ctr = ctx->decr_iv.u.ints[GCM_MSG_CTR_IX] & MASK_CTR;
+  uint32_t min_ctr  = IV_GET_CTR_WORD(ctx->decr_iv) & MASK_CTR;
   if (rcv_ctr < min_ctr) {
     return false;  // A previously seen sequence ID.
   }
@@ -523,7 +523,7 @@ gcm_decrypt(gcm_ctx *ctx, gcm_str *in, gcm_str *out, int *error) {
   // be DIFFERENT-- if we're the client, the inbound message should
   // have the server origin bit set.  If we're the server, the inbound
   // message should not have the bit set.  
-  if (!((in->counter_word & F_SERVER_ORIGIN) ^ ctx->origin_bit)) {
+  if (!(IV_GET_ORIGIN(in->iv) ^ ctx->origin_bit)) {
     return false;
   }
 
