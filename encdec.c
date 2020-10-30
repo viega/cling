@@ -16,7 +16,7 @@
 // The authentication tag size can theoretically be shortened, but
 // this has an outsized impact on the forgeability of messages, so
 // leave at 16.
-#define GCM_TAG_LEN 16
+#define GCM_TAG_LEN  16
 // 12 bytes is, by far, the most efficient length for a GCM
 // initialization vector.  Keeping it this size avoids paying the
 // price of hashing the IV.
@@ -26,21 +26,21 @@
 // the prevalance of hardware acceleration is such that we don't
 // recommend smaller keys.  If we add future flexibility, this is the
 // only parameter that we'd consider changing.
-#define AES_KEYLEN 32
+#define AES_KEYLEN   32
 
 // In this library, when we initialize a GCM context, we must indicate
 // whether we are the client or the server.  We maintain separate
 // nonce spaces for the two sides, so that messages don't have to be
 // sent in lockstep.
-#define ROLE_CLIENT 0
-#define ROLE_SERVER 1
+#define ROLE_CLIENT  0
+#define ROLE_SERVER  1
 
 // This value specifies the total number of messages either side of
 // the connection will allow to be sent, before terminating.  Note
 // that this is not the total number of encryption operations, it's
 // the total number of messages.  To be conservative, we limit it to
 // 2^20 (over 2M messages)
-#define MAX_MESSAGES     0x00200000
+#define MAX_MESSAGES 0x00200000
 
 // We will only ever use 24 bits for the message counter.
 // For the rest of the nonce, we will reserve a byte for
@@ -172,8 +172,14 @@ typedef struct {
   uint32_t tag_length;  // Either 16 or 0; 16 if it's ct, 0 if it's plaintext.
   gcm_iv_t iv;          // Initialization Vector used for this message.
   uint32_t aad_length;
-  bool     plaintext;
-  struct   iovec *iov;
+  // When accessing a message, we should be able to address the pt and ct
+  // By requesting them, and we also need to know which iovec is the input
+  // and output.   So for convenience, store the two vectors in two different
+  // sets of points.
+  struct   iovec *in_iov;
+  struct   iovec *out_iov;
+  struct   iovec *pt_iov;
+  struct   iovec *ct_iov;
   uint8_t  payload[0];
 } gcm_str;
 
@@ -298,7 +304,7 @@ gcm_initialize(aes_key_t *key,
 // decryption.  This code is used by both to perform the desired
 // operation, and read the result.
 bool
-gcm_send_kernel_msg(gcm_ctx *ctx, gcm_str *in, gcm_str *out,
+gcm_send_kernel_msg(gcm_ctx *ctx, gcm_str *str, 
 		    uint32_t operation, int *error) {
   // Set up the encryption request.  The struct msghdr object is
   // actually the entire message that we will pass to the kernel --
@@ -340,7 +346,7 @@ gcm_send_kernel_msg(gcm_ctx *ctx, gcm_str *in, gcm_str *out,
   // meaning we can send in an array of pointers to strings for the
   // kernel to treat as a consecutive message.  For right now, we
   // will just one-shot encrypt, instead of incrementally doing so.
-  msg.msg_iov        = in->iov;
+  msg.msg_iov        = str->in_iov;
   msg.msg_iovlen     = 1;
 
   // Here, we're using the kernel's APIs for adding metadata to our
@@ -356,14 +362,14 @@ gcm_send_kernel_msg(gcm_ctx *ctx, gcm_str *in, gcm_str *out,
   header->cmsg_level             = SOL_ALG;
   header->cmsg_type              = ALG_SET_IV;
   header->cmsg_len               = CMSG_SPACE(sizeof(gcm_iv_t));
-  memcpy(CMSG_DATA(header), &in->iv, sizeof(gcm_iv_t));
+  memcpy(CMSG_DATA(header), &str->iv, sizeof(gcm_iv_t));
 
   // This needs to be sent, even if there is no AAD.
   header                         = CMSG_NXTHDR(&msg, header);
   header->cmsg_level             = SOL_ALG;
   header->cmsg_type              = ALG_SET_AEAD_ASSOCLEN;
   header->cmsg_len               = CMSG_LEN(sizeof(uint32_t));
-  *(uint32_t *)CMSG_DATA(header) = in->aad_length;
+  *(uint32_t *)CMSG_DATA(header) = str->aad_length;
   
   if (sendmsg(ctx->fd, &msg, 0) < 0) {
     *error = errno;
@@ -381,17 +387,17 @@ gcm_send_kernel_msg(gcm_ctx *ctx, gcm_str *in, gcm_str *out,
   //    buffer must be big enough to hold both the AAD and the message.
   //    It does this so that it can do in-place operations.
   
-  uint32_t outlen = in->msg_length; 
+  uint32_t outlen = str->msg_length; 
   ssize_t  n;
   uint8_t *outptr;
 
   if (operation == ALG_OP_ENCRYPT) {
     outlen += GCM_TAG_LEN;
   }
-  outptr = out->iov->iov_base;
+  outptr = str->out_iov->iov_base;
 
   while (outlen) {
-    n = read(ctx->fd, out, outlen);
+    n = read(ctx->fd, outptr, outlen);
     if (n > 0) {
       outptr += n;
       outlen -= n;
@@ -424,16 +430,10 @@ gcm_send_kernel_msg(gcm_ctx *ctx, gcm_str *in, gcm_str *out,
 // This currently doesn't do sufficient error handling, which is a big
 // TODO item.
 bool
-gcm_encrypt(gcm_ctx *ctx, gcm_str *in, gcm_str *out, int *error) {
+gcm_encrypt(gcm_ctx *ctx, gcm_str *str, int *error) {
   // This check ensures that we stop encrypting when
   // we hit the message send limit in MAX_MESSAGES.
   if (ctx->encrypt_limit) return false;
-
-  // Basic sanity checks to prevent gross programmer error.
-  // Generally, we expect the gcm_str data structures to
-  // be set up properly when created.
-  if (in->msg_length != out->msg_length) return false;
-  if (!in->plaintext) return false;
 
   // Our first order of business is to set the 64 bits of IV that
   // is NOT the message counter (the message counter is incremented
@@ -481,17 +481,16 @@ gcm_encrypt(gcm_ctx *ctx, gcm_str *in, gcm_str *out, int *error) {
   ctx->encr_iv.u.ints[GCM_HPT_IX] ^= nanoseconds;
   ctx->encr_iv.u.ints[GCM_PID_IX] ^= getpid();
 
-  // We store the nonce in both the input and output strings.
-  // gcm_send_kernel_msg() looks for it in the input.
-  memcpy(&in->iv,  &ctx->encr_iv,  sizeof(gcm_iv_t));  
-  memcpy(&out->iv, &ctx->encr_iv, sizeof(gcm_iv_t));
+  // We store the nonce in both the ctx object and the str object.
+  memcpy(&str->iv,  &ctx->encr_iv,  sizeof(gcm_iv_t));  
 
-  if (!gcm_send_kernel_msg(ctx, in, out, ALG_OP_ENCRYPT, error)) {
+  if (!gcm_send_kernel_msg(ctx, str, ALG_OP_ENCRYPT, error)) {
     return false;
   }
 
-  // Finally, increment the sender nonce in the context object,
-  // prepping it for the next message.
+  // Finally, increment the sender IV in the context object,
+  // prepping it for the next message.  Don't touch the IV in the
+  // str object, it should be set to the IV used for encryption.
   uint32_t counter_word = IV_GET_CTR_WORD(ctx->encr_iv) + 1;
   if ((counter_word & MASK_CTR) >= MAX_MESSAGES) {
     ctx->encrypt_limit = true;
@@ -501,7 +500,7 @@ gcm_encrypt(gcm_ctx *ctx, gcm_str *in, gcm_str *out, int *error) {
 }
 
 bool
-gcm_decrypt(gcm_ctx *ctx, gcm_str *in, gcm_str *out, int *error) {
+gcm_decrypt(gcm_ctx *ctx, gcm_str *str, int *error) {
   // For decryption, the gcm_str input object should have the nonce
   // set that was sent with the message.  In terms of validating the
   // nonce, we can ignore the first 64 bits, and just sanity check the
@@ -511,7 +510,7 @@ gcm_decrypt(gcm_ctx *ctx, gcm_str *in, gcm_str *out, int *error) {
 
   // Counter received in IV w/ plaintext.  Note that both of these
   // should be directly comparable, already in host byte order.
-  uint32_t rcv_ctr  = IV_GET_CTR_WORD(in->iv)       & MASK_CTR;
+  uint32_t rcv_ctr  = IV_GET_CTR_WORD(str->iv)      & MASK_CTR;
   // The minimum acceptable counter value, based on last decrypted msg.
   uint32_t min_ctr  = IV_GET_CTR_WORD(ctx->decr_iv) & MASK_CTR;
   if (rcv_ctr < min_ctr) {
@@ -523,11 +522,13 @@ gcm_decrypt(gcm_ctx *ctx, gcm_str *in, gcm_str *out, int *error) {
   // be DIFFERENT-- if we're the client, the inbound message should
   // have the server origin bit set.  If we're the server, the inbound
   // message should not have the bit set.  
-  if (!(IV_GET_ORIGIN(in->iv) ^ ctx->origin_bit)) {
+  if (!(IV_GET_ORIGIN(str->iv) ^ ctx->origin_bit)) {
     return false;
   }
 
-  // At this point, the nonce has passed muster
+  // At this point, the nonce has passed muster, so let's decrypt.
+
+  // Finally, we update the decryption nonce in the ctx object.
 }
 
 // Initial dummy test program.
@@ -542,28 +543,25 @@ main(int argc, char **argv, char **envp) {
 	      }
   };
   gcm_ctx      ctx;
-  gcm_str      in, out;
+  gcm_str      s;
   int          err;
   char        *plaintext = "[AAD]This is a test.";
   char         outbuf[100];
   struct iovec invector[1], outvector[1];
   
-  in.msg_length       = strlen(plaintext)-5;
-  in.tag_length       = 16;
-  in.aad_length       = 0;
-  in.plaintext        = true;
-  in.iov              = invector;
+  s.msg_length       = strlen(plaintext)-5;
+  s.tag_length       = 16;
+  s.aad_length       = 0;
+  s.in_iov           = invector;
+  s.out_iov          = outvector;
+  s.pt_iov           = invector;
+  s.ct_iov           = outvector;
   invector->iov_base  = (void *)plaintext;
-  invector->iov_len   = in.msg_length + in.aad_length;
-  out.msg_length      = in.msg_length;
-  out.tag_length      = 0;
-  out.aad_length      = 0;
-  out.plaintext       = false;
-  out.iov             = outvector;
+  invector->iov_len   = s.msg_length + s.aad_length;
   outvector->iov_base = (void *)outbuf;
-  outvector->iov_len  = out.msg_length;
+  outvector->iov_len  = s.msg_length + s.aad_length + 5;
   gcm_initialize(&key, ROLE_CLIENT, &ctx);
-  if (gcm_encrypt   (&ctx, &in, &out, &err) == true) {
+  if (gcm_encrypt   (&ctx, &s, &err) == true) {
     printf("gcm_encrypt succeeded\n");
   } 
 }
