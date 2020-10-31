@@ -1,94 +1,4 @@
-#include <sys/types.h>
-#include <sys/socket.h>
-#include <sys/random.h>
-#include <arpa/inet.h>
-#include <linux/if_alg.h>
-#include <stdio.h>
-#include <errno.h>
-#include <stdbool.h>
-#include <string.h>
-#include <unistd.h>
-#include <time.h>
-
-// Note that, while these values theoretically have some flexibility,
-// there are good reasons to never change them.
-
-// The authentication tag size can theoretically be shortened, but
-// this has an outsized impact on the forgeability of messages, so
-// leave at 16.
-#define GCM_TAG_LEN  16
-// 12 bytes is, by far, the most efficient length for a GCM
-// initialization vector.  Keeping it this size avoids paying the
-// price of hashing the IV.
-#define GCM_IV_LEN   12
-// We are going ahead and using AES-256 for all sessions.  That is, 32
-// byte (256 bit) keys.  128 bits is generally considered "enough" but
-// the prevalance of hardware acceleration is such that we don't
-// recommend smaller keys.  If we add future flexibility, this is the
-// only parameter that we'd consider changing.
-#define AES_KEYLEN   32
-
-// In this library, when we initialize a GCM context, we must indicate
-// whether we are the client or the server.  We maintain separate
-// nonce spaces for the two sides, so that messages don't have to be
-// sent in lockstep.
-#define ROLE_CLIENT  0
-#define ROLE_SERVER  1
-
-// This value specifies the total number of messages either side of
-// the connection will allow to be sent, before terminating.  Note
-// that this is not the total number of encryption operations, it's
-// the total number of messages.  To be conservative, we limit it to
-// 2^20 (over 2M messages)
-#define MAX_MESSAGES 0x00200000
-
-// We will only ever use 24 bits for the message counter.
-// For the rest of the nonce, we will reserve a byte for
-// connection state, and then fill the rest with random
-// bits at the beginning of the connection.
-
-// bytes 0-3:  Random bytes chosen at message encrypt time,
-//             XOR'd with a high-precision timer.
-// bytes 4-7:  Random bytes chosen at message encrypt time,
-//             XOR'd with the PID of the current process.
-// byte  8:    Flags that hold connection state (like identifying the
-//             origin as the sender or receiver)
-// bytes 9-11: The 24-bit message counter.
-
-// Indexing into a 32-bit array, which word contains the appropriate value?
-#define GCM_HPT_IX      0
-#define GCM_PID_IX      1
-#define GCM_MSG_CTR_IX  2
-
-// The message counter is stored in a 32 bit word, but is only
-// a 24-bit value.  The rest of the word/half word is reserved for
-// flags that indicate the sending context (e.g., if the client
-// sent a message or the server did), in order to avoid nonce
-// reuse.  Below are masks that extract either the counter, or
-// any flags we use.
-//
-// Note that we will operate on this word using the host machine's
-// integer operations, which may have an incompatable byte ordering
-// with the underlying byte stream (we store data and put it on the
-// wire in big endian).  Therefore, these masks should only be applied
-// once the word is loaded in HOST byte order.
-
-// The most significant bit is on when the server-side originates
-// a message, and off when it's the client.
-#define F_SERVER_ORIGIN  0x80000000
-#define F_CLIENT_ORIGIN  0x00000000
-// This flag may be used to help negotiate retransmissions
-// when I get that far.  It's just a placeholder at the moment.
-#define F_CONTROL_MSG    0x40000000
-// Right now, F_CTR_OVERFLOW is also unused; instead, the check 
-// is on a comparison against MAX_MESSAGES.
-#define F_CTR_OVERFLOW   0x01000000
-// When treating the lower 32 bits of the IV as an int, this
-// removes the flags, and gives us just the counter.
-#define MASK_CTR         0x00ffffff
-// Masks out the lower 32 bits of an 64-bit int, which we use
-// when getting clock data.
-#define MASK_LOWER_32    ((uint64_t)0xffffffff)
+#include "encdec.h"
 
 // This is the specification we need to pass to the kernel
 // when we create a file descriptor, in order for writes
@@ -101,87 +11,6 @@ struct sockaddr_alg gcm_spec = {
     .salg_type   = "aead",
     .salg_name   = "gcm(aes)"
 };
-
-// For our perposes, AES keys really only need to be an array of
-// bytes.  We use a fixed-size key, so don't even need to keep
-// track of the key size.
-typedef struct {
-  uint8_t key[AES_KEYLEN];
-} aes_key_t;
-
-// Note that nonces are stored in network byte order, so when we pull
-// from nonce.u.ints we need to call ntohl (and the reverse when we
-// store this way).  This data structure should be memory-compatable
-// with the kernel's struct af_alg_iv with a 12 byte nonce.  However,
-// we lay it out this way to make it easier for us to operate on the
-// nonce in different ways depending on our needs.
-typedef struct {
-  uint32_t   ivlen;
-  union {
-    uint32_t ints [3];
-    uint8_t  bytes[12];
-  } u;
-} gcm_iv_t;
-
-// These macros assume you're operating on an object of type
-// gcm_iv_t, not a reference to an object.  We do this because
-// IVs are embedded in gcm_ctx and gcm_str, and so we'll be
-// holding a pointer to those objects; nothing will be holding
-// pointers to IVs.
-#define IV_GET_CTR_WORD(iv)    (ntohl((iv).u.ints[GCM_MSG_CTR_IX]))
-#define IV_SET_CTR_WORD(iv, c) ((iv).u.ints[GCM_MSG_CTR_IX] = htonl(c))
-#define IV_GET_ORIGIN(iv)      (IV_GET_CTR_WORD(iv) & F_SERVER_ORIGIN)
-
-// This context object holds all the state associated with a single
-// symmetric encryption session.  It contains references to the file
-// descriptors in use to talk to the kernel, and information about
-// initialization vectors for communication in both directions.  It
-// also contains a boolean flag that indicates that the session should
-// be terminated for reaching the limit of messages sent.
-//
-// Note that we do NOT store the key in this structure; once we pass
-// it to the kernel, it's best not to keep any key material in
-// userland.  To that end, we will generally attempt to wipe the key
-// from memory after we key the cipher.
-//
-// In the future we might support state resumption, at which point we
-// will look to securely store key info (requiring decrypting at
-// startup).
-
-typedef struct {
-  int       listen_fd;
-  int       fd;
-  gcm_iv_t  encr_iv; // IV for encrypting messages.
-  gcm_iv_t  decr_iv; // IV for decrypting messages.
-  bool      encrypt_limit;
-  uint32_t  origin_bit;
-} gcm_ctx;
-
-// The gcm_str data type is used to hold plaintext and ciphertext
-// both, and accounts for the metadata associated with them.  Please
-// only use the APIs for accessing these, to avoid any kind of memory
-// error.
-typedef struct {
-  // The first fields are internal accounting.
-  // Note that the total length of the input payload 
-  // should be aad_length + msg_length,
-  // and the total length of the output payload
-  // should be msg_length + tag_length.
-  
-  uint32_t msg_length;  // length of the plaintext/ciphertext.
-  uint32_t tag_length;  // Either 16 or 0; 16 if it's ct, 0 if it's plaintext.
-  gcm_iv_t iv;          // Initialization Vector used for this message.
-  uint32_t aad_length;
-  // When accessing a message, we should be able to address the pt and ct
-  // By requesting them, and we also need to know which iovec is the input
-  // and output.   So for convenience, store the two vectors in two different
-  // sets of points.
-  struct   iovec *in_iov;
-  struct   iovec *out_iov;
-  struct   iovec *pt_iov;
-  struct   iovec *ct_iov;
-  uint8_t  payload[0];
-} gcm_str;
 
 // This private function sets up the initial IV for gcm.
 // The IV consists of 3 parts, per above...
@@ -259,17 +88,24 @@ gcm_init_ivs(gcm_ctx *ctx, int role) {
 // the process on either side dies), then we will have a different API
 // for the state load / resumption.
 //
-// This currently isn't doing any error checking, which is definitely
-// TODO soon.
+// Realistically, none of these calls should fail as long as the code
+// is running on a proper kernel, or if the system runs out of file
+// descriptors.  If it's not working on an idle machine, the former is
+// suspect.  Otherwise, it's the later.  Therefore, we don't worry
+// about specific error codes, and just return success or failure.
+//
+// @param ctx  The context object to initialize.
+// @param key  A 256-bit AES key.
+// @param role Either ROLE_CLIENT or ROLE_SERVER
+// @return true unless there's a kernel-level issue.
 bool
-gcm_initialize(aes_key_t *key,
-	       int32_t    role,
-	       gcm_ctx   *ctx) {
+gcm_initialize(gcm_ctx   *ctx,
+	       aes_key_t *key,
+	       int32_t    role) {
   ctx->listen_fd = socket(AF_ALG, SOCK_SEQPACKET, 0);
   if (bind(ctx->listen_fd,
 	   (struct sockaddr *)&gcm_spec,
 	   sizeof(gcm_spec)) < 0) {
-    perror("bind");
     return false;
   }
   if (setsockopt(ctx->listen_fd,
@@ -277,7 +113,6 @@ gcm_initialize(aes_key_t *key,
 		 ALG_SET_AEAD_AUTHSIZE,
 		 NULL,
 		 GCM_TAG_LEN) < 0) {
-    perror("setsockopt:tag size");
     return false;
   }
   if (setsockopt(ctx->listen_fd,
@@ -285,12 +120,10 @@ gcm_initialize(aes_key_t *key,
 		 ALG_SET_KEY,
 		 key->key,
 		 AES_KEYLEN) < 0) {
-    perror("setsockopt:key");
     return false;
   }
   ctx->fd = accept(ctx->listen_fd, NULL, 0);
   if (ctx->fd < 0) {
-    perror("accept");
     return false;
   }
   gcm_init_ivs(ctx, role);
@@ -303,7 +136,7 @@ gcm_initialize(aes_key_t *key,
 // The kernel uses a pretty regular interface for encryption and
 // decryption.  This code is used by both to perform the desired
 // operation, and read the result.
-bool
+static bool
 gcm_send_kernel_msg(gcm_ctx *ctx, gcm_str *str, 
 		    uint32_t operation, int *error) {
   // Set up the encryption request.  The struct msghdr object is
@@ -319,8 +152,7 @@ gcm_send_kernel_msg(gcm_ctx *ctx, gcm_str *str,
   // struct cmsghdr.  We'll actually create 3 such records, and those
   // records will all live in memory that we'll allocate on the stack
   // (see the variable mbuf below).
-
-  struct msghdr   msg = {0,};
+  struct msghdr   msg    = {0,};
   struct cmsghdr *header = NULL;
   
   // We must pass the kernel metadata about what we're about to
@@ -373,7 +205,6 @@ gcm_send_kernel_msg(gcm_ctx *ctx, gcm_str *str,
   
   if (sendmsg(ctx->fd, &msg, 0) < 0) {
     *error = errno;
-    perror("sendmsg");
     return false;
   }
 
@@ -404,7 +235,6 @@ gcm_send_kernel_msg(gcm_ctx *ctx, gcm_str *str,
     } else {
       if (errno != EINTR) {
 	*error = errno;
-	perror("read");
 	return false;
       }
     }
@@ -413,27 +243,20 @@ gcm_send_kernel_msg(gcm_ctx *ctx, gcm_str *str,
   return true;
 }
 
-// We require AAD and plaintext to be sequential in memory, as the kernel
-// expects that, and we don't want to do any unnecessary copying of strings.
 // @param ctx       The gcm context to use for encrypting.
-// @param in        AAD || Plaintext
-// @param total_len length of AAD||Plaintext in bytes
-// @param aad_len   length of AAD
-// @param out       Pointer to memory for storing output
-// @param outlen    Length of the output buffer.  Must be the size of the plaintext plus 16 bytes.
-// @param noncelet  A pointer to memory to hold a random 32-bit word used in the iv.
+// @param str       A gcm_str object that holds both the input and the output.
 // @param error     Error code, if appropriate
-// @return True if successful, false if error.
-
-// Note that the out string must be pre-allocated to the right length
-// (allowing the caller to determine heap or stack).
-// This currently doesn't do sufficient error handling, which is a big
-// TODO item.
+// @return true if successful, false if error.
 bool
 gcm_encrypt(gcm_ctx *ctx, gcm_str *str, int *error) {
-  // This check ensures that we stop encrypting when
-  // we hit the message send limit in MAX_MESSAGES.
-  if (ctx->encrypt_limit) return false;
+  *error = 0;
+  
+  // This check ensures that we stop encrypting when we hit the
+  // message send limit in MAX_MESSAGES.
+  if (ctx->encrypt_limit) {
+    *error = ERR_ENCRYPT_LIMIT;
+    return false;
+  }
 
   // Our first order of business is to set the 64 bits of IV that
   // is NOT the message counter (the message counter is incremented
@@ -468,12 +291,18 @@ gcm_encrypt(gcm_ctx *ctx, gcm_str *str, int *error) {
   //    remember that this is a fallback for a catastrophic failure in
   //    system randomness that we hope is already unlikely to happen.
   
-  getrandom((void *)ctx->encr_iv.u.ints, 8, 0);
+  if (getrandom((void *)ctx->encr_iv.u.ints, 8, 0) == -1) {
+    *error = errno;
+    return false;
+  }
 
   struct timespec now;
   uint32_t        nanoseconds;
   
-  clock_gettime(CLOCK_BOOTTIME, &now);
+  if (clock_gettime(CLOCK_BOOTTIME, &now) == -1) {
+    *error = errno;
+    return false;
+  }
 
   // This ensures we portably get the lower 32 bits, no matter
   // how big a long is.
@@ -499,8 +328,14 @@ gcm_encrypt(gcm_ctx *ctx, gcm_str *str, int *error) {
   return true;
 }
 
+// @param ctx The context object.
+// @param str The gcm_str object for this operation.
+// @param error Holds any error code.
+// @return true if successful, false if there's an error.
 bool
 gcm_decrypt(gcm_ctx *ctx, gcm_str *str, int *error) {
+  *error = 0;
+  
   // For decryption, the gcm_str input object should have the nonce
   // set that was sent with the message.  In terms of validating the
   // nonce, we can ignore the first 64 bits, and just sanity check the
@@ -514,62 +349,28 @@ gcm_decrypt(gcm_ctx *ctx, gcm_str *str, int *error) {
   // The minimum acceptable counter value, based on last decrypted msg.
   uint32_t min_ctr  = IV_GET_CTR_WORD(ctx->decr_iv) & MASK_CTR;
   if (rcv_ctr < min_ctr) {
+    *error = ERR_BAD_PLAINTEXT;
     return false;  // A previously seen sequence ID.
   }
-  //
+
   // This XOR operation compares the server origin bit in the counter
   // word to this GCM context's stored origin bit.  They should
   // be DIFFERENT-- if we're the client, the inbound message should
   // have the server origin bit set.  If we're the server, the inbound
   // message should not have the bit set.  
   if (!(IV_GET_ORIGIN(str->iv) ^ ctx->origin_bit)) {
+    *error = ERR_BAD_ORIGIN;
     return false;
   }
 
   // At this point, the nonce has passed muster, so let's decrypt.
-
+  if (!gcm_send_kernel_msg(ctx, str, ALG_OP_DECRYPT, error)) {
+    return false;
+  }
   // Finally, we update the decryption nonce in the ctx object.
+  // It should be one higher than the counter seen in the message.
+  uint32_t counter_word = IV_GET_CTR_WORD(str->iv) + 1;
+  IV_SET_CTR_WORD(ctx->decr_iv, counter_word);
+  return true;
 }
-
-// Initial dummy test program.
-int
-main(int argc, char **argv, char **envp) {
-  int fd;
-  aes_key_t key = {
-      .key = {0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
- 	      0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F,
-              0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
- 	      0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F,	      
-	      }
-  };
-  gcm_ctx      ctx;
-  gcm_str      s;
-  int          err;
-  char        *plaintext = "[AAD]This is a test.";
-  char         outbuf[100];
-  struct iovec invector[1], outvector[1];
-  
-  s.msg_length       = strlen(plaintext)-5;
-  s.tag_length       = 16;
-  s.aad_length       = 0;
-  s.in_iov           = invector;
-  s.out_iov          = outvector;
-  s.pt_iov           = invector;
-  s.ct_iov           = outvector;
-  invector->iov_base  = (void *)plaintext;
-  invector->iov_len   = s.msg_length + s.aad_length;
-  outvector->iov_base = (void *)outbuf;
-  outvector->iov_len  = s.msg_length + s.aad_length + 5;
-  gcm_initialize(&key, ROLE_CLIENT, &ctx);
-  if (gcm_encrypt   (&ctx, &s, &err) == true) {
-    printf("gcm_encrypt succeeded\n");
-  } 
-}
-
-
-
-
-
-
-
 
