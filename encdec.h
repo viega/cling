@@ -177,6 +177,12 @@ typedef struct {
   struct   iovec *out_iov;
   struct   iovec *pt_iov;
   struct   iovec *ct_iov;
+  // For input to an operation, the kernel can gather strings that are
+  // scattered around memory.  Each iovec holds a pointer to a string
+  // (along w/ an indication of size), and in_iov is actually a pointer
+  // to an ARRAY of struct iovec objects.  The iov_count field specifies
+  // how many items are in the in_iov array.  
+  uint32_t iov_count;
   uint8_t  payload[0];
 } gcm_str;
 

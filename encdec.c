@@ -174,12 +174,12 @@ gcm_send_kernel_msg(gcm_ctx *ctx, gcm_str *str,
 
   msg.msg_control    = (void *)mbuf;
   msg.msg_controllen = mbuf_len;
-  // Note that IOV stands for "IO vector",
-  // meaning we can send in an array of pointers to strings for the
-  // kernel to treat as a consecutive message.  For right now, we
-  // will just one-shot encrypt, instead of incrementally doing so.
+  // Note that IOV stands for "IO vector", meaning we can send in an
+  // array of items that point to strings, for the kernel to treat as
+  // a consecutive message.  For right now, we will just one-shot
+  // encrypt from a single buffer.
   msg.msg_iov        = str->in_iov;
-  msg.msg_iovlen     = 1;
+  msg.msg_iovlen     = str->iov_count;
 
   // Here, we're using the kernel's APIs for adding metadata to our
   // message.

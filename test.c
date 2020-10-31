@@ -4,7 +4,6 @@
 
 int
 main(int argc, char **argv, char **envp) {
-  int fd;
   aes_key_t key = {
       .key = {0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
  	      0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F,
@@ -28,6 +27,7 @@ main(int argc, char **argv, char **envp) {
   s.out_iov           = outvector;
   s.pt_iov            = invector;
   s.ct_iov            = outvector;
+  s.iov_count         = 1;
   invector->iov_base  = (void *)plaintext;
   invector->iov_len   = s.msg_length + s.aad_length;
   outvector->iov_base = (void *)outbuf;
@@ -43,6 +43,7 @@ main(int argc, char **argv, char **envp) {
   check.out_iov         = checkvector;
   check.pt_iov          = checkvector;
   check.ct_iov          = outvector;
+  check.iov_count       = 1;
   checkvector->iov_base = (void *)checkbuf;
   checkvector->iov_len  = s.msg_length + s.aad_length;
   
