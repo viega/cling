@@ -28,7 +28,7 @@ sha512_initialize(sha512_ctx *ctx) {
   return true;
 }
 
-static bool
+bool
 sha512_update(sha512_ctx *ctx, const uint8_t *data, size_t len, int *error) {
   if (send(ctx->fd, data, len, MSG_MORE) != len) {
     *error = errno;
@@ -37,7 +37,7 @@ sha512_update(sha512_ctx *ctx, const uint8_t *data, size_t len, int *error) {
   return true;
 }
   
-static bool
+bool
 sha512_final(sha512_ctx *ctx, sha512_tag *tag, int *error) {
   if (recv(ctx->fd, tag->bytes, SHA512_TAG_LENGTH, 0) != SHA512_TAG_LENGTH) {
     *error = errno;
@@ -46,8 +46,9 @@ sha512_final(sha512_ctx *ctx, sha512_tag *tag, int *error) {
   return true;
 }
 
-static bool
-sha512(sha512_ctx *ctx, uint8_t *data, size_t len, sha512_tag *tag, int *error) {
+bool
+sha512(sha512_ctx *ctx, const uint8_t *data, size_t len,
+       sha512_tag *tag, int *error) {
   if (send(ctx->fd, data, len, 0) != len) {
     *error = errno;
     return false;
