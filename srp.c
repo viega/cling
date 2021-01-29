@@ -4,7 +4,10 @@
 
 #include "sha512.h"
 
+// This is an implementation of SRP-6a, which is now in the public domain.
+
 #define SRP_PRIME_SIZE 2048
+#define SRP_TEST_PRIME_SIZE 8
 // This 2048-bit prime is represented as an ASCII decimal string.
 // It was generated using libtomcrypt's mp_prime_rand().
 // In base 10, it is:
@@ -18,6 +21,7 @@
 // 8265285955583376466814924469336968027504068363361346982874722604064289572518
 // 187212907
 
+uint8_t test_N[] = {'\x17'};
 uint8_t N[] = {
 	       '\x92', '\x0A', '\xD1', '\xED', '\xED', '\xC7', '\x17', '\xBA',
 	       '\x3B', '\xFE', '\x24', '\xBB', '\xAB', '\xE1', '\x08', '\x37',
@@ -56,20 +60,24 @@ uint8_t N[] = {
 // This is going to get hashed.
 static uint8_t g = 2;
 
-static mp_int mp_N;
-static mp_int mp_g;
-static mp_int mp_k;
-static bool   inited = false;
+static mp_int     mp_N;
+static mp_int     mp_g;
+static mp_int     mp_k;
+static mp_int     mp_nil; // Used to test if A should be accepted.
+static sha512_tag H_N;  
+static bool       inited = false;
 
 typedef struct {
+  // We put pointers to the static value just to make the code a bit more clear (for me at least).
   mp_int    *N_ptr; // Our large public safe prime (above).
   mp_int    *g_ptr; // 2.
   mp_int    *k_ptr; // A multiplier parameter: H(N,g)
+  mp_int    *Zero_ptr; // A pointer to zero.
   mp_int     u; // Random scrambling parameter;
   mp_int     a; // Secret ephemeral value used to compute A
   mp_int     b; // Secret ephemeral value used to compute B
-  mp_int     A; // The public ephemeral value sent by the initiator
-  mp_int     B; // The public ephemeral value sent by the receiver.
+  mp_int     A; // The public ephemeral value sent by party 1 (the initiator)
+  mp_int     B; // The public ephemeral value sent by party 2
   mp_int     x; // The private key.
   mp_int     v; // Password verifier.
   mp_int     S; // The session key, prior to applying our hash function
@@ -78,8 +86,24 @@ typedef struct {
   uint32_t   saltlen;
   uint32_t   namelen;
   sha512_ctx hctx;
+  sha512_tag keymatter;
+  sha512_tag proof1;
+  sha512_tag proof2;
 } srp_ctx;
 
+static void
+internal_print_bignum(mp_int *n) {
+  size_t size, written;
+  char  *s;
+
+  if (mp_radix_size(n, 10, &size) != MP_OKAY) { exit(-1); }
+  s = (char *)malloc(size);
+
+  if (mp_to_radix(n, s, size, &written, 10) != MP_OKAY) { exit(-1); }
+
+  printf("%s", s);
+  free(s);
+}
 
 // k is a hash of N and g, that will then be used as a number in GF(N)
 // So we take the hash and convert it to a bignum.
@@ -97,20 +121,31 @@ srp_compute_k(srp_ctx *ctx) {
   if (mp_from_ubin(&mp_k, (const uint8_t *)&tag.bytes, SHA512_TAG_LENGTH) != MP_OKAY) {
     exit(-1);
   }
+  if (mp_mod(&mp_k, &mp_N, &mp_k) != MP_OKAY) { exit(-1); }
 }
 
 void
 srp_init(srp_ctx *ctx) {
+  int error;
+  
   sha512_initialize(&ctx->hctx);
   if (!inited) {
-    if (mp_init(&mp_N) != MP_OKAY)                    { exit(-1); }
+    if (mp_init(&mp_N)    != MP_OKAY)                 { exit(-1); }
+    if (mp_init(&mp_nil)  != MP_OKAY)                 { exit(-1); }
+    if (mp_init(&mp_g)    != MP_OKAY)                 { exit(-1); }
     if (mp_from_ubin(&mp_N, N, sizeof(N)) != MP_OKAY) { exit(-1); }
-    if (mp_init_i32(&mp_g, 2) != MP_OKAY)             { exit(-1); }
+    mp_set(&mp_nil, 0);
+    mp_set(&mp_g,    2);
     srp_compute_k(ctx);
+    // Not quite following the suggested proof here.  The one they
+    // provide is overkill anyway.
+    sha512_update(&ctx->hctx, N,  sizeof(N), &error);
+    sha512_final (&ctx->hctx, &H_N, &error);
   }
-  ctx->N_ptr = &mp_N;
-  ctx->g_ptr = &mp_g;
-  ctx->k_ptr = &mp_k;
+  ctx->N_ptr    = &mp_N;
+  ctx->g_ptr    = &mp_g;
+  ctx->k_ptr    = &mp_k;
+  ctx->Zero_ptr = &mp_nil;
   if (mp_init(&ctx->u) != MP_OKAY)    { exit(-1); }
   if (mp_init(&ctx->a) != MP_OKAY)    { exit(-1); }
   if (mp_init(&ctx->b) != MP_OKAY)    { exit(-1); }
@@ -137,19 +172,31 @@ srp_compute_x(srp_ctx *ctx, uint8_t *pw, uint32_t pwlen) {
   if (mp_from_ubin(&ctx->x, (const uint8_t *)&tag.bytes, SHA512_TAG_LENGTH) != MP_OKAY) {
     exit(-1);
   }
+  if (mp_mod(&ctx->x, ctx->N_ptr, &ctx->x) != MP_OKAY) { exit(-1); }
 }
 
 void
-srp_compute_v(srp_ctx *ctx) {
+srp_compute_v(srp_ctx *ctx, uint8_t *pw, uint32_t pwlen) {
   // v = g^x mod N
+  //printf("g(2): ");
+  //internal_print_bignum(ctx->g_ptr);
+  // printf("N(2): ");
+  //internal_print_bignum(ctx->N_ptr);
+  //printf("salt(2): %s\n", (char *)ctx->salt);
+  //printf("pw(2): %s\n", (char *)pw);
+  srp_compute_x(ctx, pw, pwlen);
+  //printf("x(2): ");
+  //internal_print_bignum(&ctx->x);
   if (mp_exptmod(ctx->g_ptr, &ctx->x, &mp_N, &ctx->v) != MP_OKAY) { exit(-1); }
+  //printf("v(2): ");
+  //internal_print_bignum(&ctx->v);
 }
 
 void
 srp_select_random(srp_ctx *ctx, mp_int *out) {
   uint8_t randbytes[SRP_PRIME_SIZE/8];
-  
-  if (getrandom(randbytes, SRP_PRIME_SIZE/8, 0) != SRP_PRIME_SIZE) {
+
+  if (getrandom(randbytes, SRP_PRIME_SIZE/8, 0) != SRP_PRIME_SIZE/8) {
     exit(-1);
   }
   if (mp_from_ubin(out, randbytes, SRP_PRIME_SIZE/8) != MP_OKAY) {
@@ -157,11 +204,20 @@ srp_select_random(srp_ctx *ctx, mp_int *out) {
   }
 }
 
-void
-srp_initiator_compute_A(srp_ctx *ctx) {
+static void
+srp_compute_A(srp_ctx *ctx) {
   srp_select_random(ctx, &ctx->a);
+  if (mp_mod(&ctx->a, ctx->N_ptr, &ctx->a) != MP_OKAY) { exit(-1); }
   // A = g^a mod N
   if (mp_exptmod(ctx->g_ptr, &ctx->a, ctx->N_ptr, &ctx->A) != MP_OKAY) { exit(-1); }
+  //printf("g(1): ");
+  //internal_print_bignum(ctx->g_ptr);
+  //printf("a(1): ");
+  //internal_print_bignum(&ctx->a);
+  //printf("N(1): ");
+  //internal_print_bignum(ctx->N_ptr);
+  //printf("A(1): ");
+  //internal_print_bignum(&ctx->A);
 }
 
 void
@@ -174,6 +230,8 @@ srp_compute_B(srp_ctx *ctx) {
   if (mp_init(&expr2) != MP_OKAY)   { exit(-1); }
 
   srp_select_random(ctx, &ctx->b);
+  if (mp_mod(&ctx->b, ctx->N_ptr, &ctx->b) != MP_OKAY) { exit(-1); }  
+  
   if (mp_mulmod(ctx->k_ptr, &ctx->v, ctx->N_ptr, &expr1) != MP_OKAY) {
     exit(-1);
   }
@@ -185,6 +243,17 @@ srp_compute_B(srp_ctx *ctx) {
   }
   mp_clear(&expr1);
   mp_clear(&expr2);
+
+  //printf("k(2): ");
+  //internal_print_bignum(ctx->k_ptr);
+  //printf("v(2): ");
+  //internal_print_bignum(&ctx->v);
+  //printf("g(2): ");
+  //internal_print_bignum(ctx->g_ptr);
+  //printf("b(2): ");
+  //internal_print_bignum(&ctx->b);
+  //printf("B(2): ");
+  //internal_print_bignum(&ctx->B);
 }
 
 void
@@ -206,63 +275,267 @@ srp_compute_u(srp_ctx *ctx) {
   if (mp_from_ubin(&ctx->u, (const uint8_t *)&tag.bytes, SHA512_TAG_LENGTH) != MP_OKAY) {
     exit(-1);
   }
+  if (mp_mod(&ctx->u, ctx->N_ptr, &ctx->u) != MP_OKAY) { exit(-1); }
 }
 
 // TODO: should be able to operate on expressions in-place,
 // but need to double check.  Or at least re-use the temps
 // w/o re-initing.
 void
-srp_initiator_compute_S(srp_ctx *ctx) {
-  // H(pow((B - pow(k*g,x)), (a + u*x)));
-  mp_int expr1; // k*g
-  mp_int expr2; // pow(k*g, x)
-  mp_int expr3; // B - pow(k*g, x)
+srp_party_1_compute_S(srp_ctx *ctx) {
+  // s = pow((B - k*pow(g,x)), (a + u*x));
+  mp_int expr1; // pow(g, x)
+  mp_int expr2; // k*pow(g, x)
+  mp_int expr3; // B - k*pow(g, x)
   mp_int expr4; // u*x
   mp_int expr5; // a + u*x
 
+  //printf("s1(B,k,g,x,a,u,N)...\n");
+  //printf("s1(");
+  //internal_print_bignum(&ctx->B);
+  //printf(",");
+  //internal_print_bignum(ctx->k_ptr);
+  //printf(",");
+  //internal_print_bignum(ctx->g_ptr);
+  //printf(", ");
+  //internal_print_bignum(&ctx->x);
+  //printf(", ");
+  //internal_print_bignum(&ctx->a);
+  //printf(", ");
+  //internal_print_bignum(&ctx->u);
+  //printf(", ");
+  //internal_print_bignum(ctx->N_ptr);
+  //printf(")\n");
   if (mp_init(&expr1) != MP_OKAY) { exit(-1); }    
   if (mp_init(&expr2) != MP_OKAY) { exit(-1); }
   if (mp_init(&expr3) != MP_OKAY) { exit(-1); }  
   if (mp_init(&expr4) != MP_OKAY) { exit(-1); }
   if (mp_init(&expr5) != MP_OKAY) { exit(-1); }  
-  
-  if (mp_mulmod(ctx->k_ptr, ctx->g_ptr,
-		ctx->N_ptr, &expr1)                   != MP_OKAY) { exit(-1); }
-  if (mp_exptmod(&expr1, &ctx->x, ctx->N_ptr, &expr2) != MP_OKAY) { exit(-1); }
-  if (mp_submod(&ctx->B, &expr2, ctx->N_ptr, &expr3)  != MP_OKAY) { exit(-1); }
-  if (mp_mulmod(&ctx->u, &ctx->x, ctx->N_ptr, &expr4) != MP_OKAY) { exit(-1); }
-  if (mp_addmod(&ctx->a, &expr4, ctx->N_ptr, &expr5)  != MP_OKAY) { exit(-1); }
-  if (mp_exptmod(&expr3, &expr5, ctx->N_ptr, &ctx->S) != MP_OKAY) { exit(-1); }
 
+  if (mp_exptmod(ctx->g_ptr, &ctx->x, ctx->N_ptr, &expr1) != MP_OKAY) { exit(-1); }
+  if (mp_mul(ctx->k_ptr, &expr1, &expr2) != MP_OKAY)   { exit(-1); }
+  if (mp_sub(&ctx->B, &expr2, &expr3) != MP_OKAY)      { exit(-1); }
+  if (mp_mul(&ctx->u, &ctx->x, &expr4) != MP_OKAY)     { exit(-1); }
+  if (mp_add(&ctx->a, &expr4, &expr5)  != MP_OKAY)     { exit(-1); }
+  if (mp_exptmod(&expr3, &expr5, ctx->N_ptr, &ctx->S) != MP_OKAY) { exit(-1); }
+  
   mp_clear(&expr1);
   mp_clear(&expr2);
   mp_clear(&expr3);
   mp_clear(&expr4);
-  mp_clear(&expr5);  
+  mp_clear(&expr5);
+  //printf("S ?= ");
+  //internal_print_bignum(&ctx->S);
+  //printf("\n");
 }
 
 void
-srp_receiver_compute_S(srp_ctx *ctx) {
-  // pow(pow(A*v, u), b);
-  mp_int expr1; // A*v
-  mp_int expr2; // pow(A*v, u)
+srp_party_2_compute_S(srp_ctx *ctx) {
+  // pow(A*pow(v, u), b);
+  mp_int expr1; // pow(v, u)
+  mp_int expr2; // A*pow(v, u)
 
+  //printf("s2(A, v, u, b, N)\n");
+  //printf("s2(");
+  //internal_print_bignum(&ctx->A);
+  //printf(",");
+  //internal_print_bignum(&ctx->v);
+  //printf(",");
+  //internal_print_bignum(&ctx->u);
+  //printf(",");
+  //internal_print_bignum(&ctx->b);
+  //printf(",");
+  //internal_print_bignum(ctx->N_ptr);
+  //printf(")\n");
+  
   if (mp_init(&expr1) != MP_OKAY)      { exit(-1); }
-  if (mp_init(&expr2) != MP_OKAY)      { exit(-1); }  
+  if (mp_init(&expr2) != MP_OKAY)      { exit(-1); }
 
-  if (mp_mulmod(&ctx->A, &ctx->v, ctx->N_ptr, &expr1) != MP_OKAY) { exit(-1); }
-  if (mp_exptmod(&expr1, &ctx->u, ctx->N_ptr, &expr2) != MP_OKAY) { exit(-1); }
+  if (mp_exptmod(&ctx->v, &ctx->u, ctx->N_ptr, &expr1) != MP_OKAY) { exit(-1); }
+  if (mp_mulmod(&expr1, &ctx->A, ctx->N_ptr, &expr2)   != MP_OKAY) { exit(-1); }
   if (mp_exptmod(&expr2, &ctx->b, ctx->N_ptr, &ctx->S) != MP_OKAY) { exit(-1); }
+
+    // Old and busted
+  //if (mp_mulmod(&ctx->A, &ctx->v, ctx->N_ptr, &expr1) != MP_OKAY) { exit(-1); }
+  //  if (mp_exptmod(&expr1, &ctx->u, ctx->N_ptr, &expr2) != MP_OKAY) { exit(-1); }
+  //if (mp_exptmod(&expr2, &ctx->b, ctx->N_ptr, &ctx->S) != MP_OKAY) { exit(-1); }
   
   mp_clear(&expr1);
   mp_clear(&expr2);
+  //printf("S ?= ");
+  //internal_print_bignum(&ctx->S);
+  //printf("\n");
 }
 
+void
+srp_party_1_step_1(srp_ctx *ctx) {
+  srp_compute_A(ctx);
+}
+
+bool
+srp_check_party_1_params(srp_ctx *ctx) {
+  // Party 1 fails if A mod N == 0.
+  mp_int tmp;
+  bool   ret = true;
+
+  if (mp_init(&tmp) != MP_OKAY)                { exit(-1); }
+  if (mp_mod(&ctx->A, ctx->N_ptr, &tmp) != MP_OKAY) { exit(-1); }
+  if (mp_cmp_mag(&tmp, ctx->Zero_ptr) == MP_EQ) {
+    ret = false;
+  }
+  
+  mp_clear(&tmp);
+  return ret;
+}
+
+bool
+srp_check_party_2_params(srp_ctx *ctx) {
+  // Party 2 fails if B mod N == 0 or u == 0.
+  mp_int tmp;
+  bool   ret = true;
+
+  if (mp_init(&tmp) != MP_OKAY)                     { exit(-1); }
+  if (mp_mod(&ctx->B, ctx->N_ptr, &tmp) != MP_OKAY) { exit(-1); }
+  if (mp_cmp_mag(&tmp, ctx->Zero_ptr) == MP_EQ) {
+    ret = false;
+  }
+  if (mp_cmp_mag(&ctx->u, ctx->Zero_ptr) == MP_EQ) {
+    ret = false;
+  }
+  mp_clear(&tmp);
+  return ret;
+
+}
+
+void
+compute_key_material(srp_ctx *ctx) {
+  // Hash(S)...
+  // Need to export the number to a consistent byte stream.
+  // 256 bits of the tag to the proof, 256 to the key
+  int      error;
+  size_t   outlen;
+  uint8_t *buf;
+  size_t   buflen;
+
+  buflen = mp_ubin_size(&ctx->S);
+  buf    = (uint8_t *)malloc(buflen);
+  
+  if (mp_to_ubin(&ctx->S, buf, buflen, &outlen) != MP_OKAY) { exit(-1); }
+  sha512_update(&ctx->hctx, buf, outlen, &error);
+  sha512_final (&ctx->hctx, &ctx->keymatter, &error);
+  free(buf);
+}
+
+// The design doc proof is overkill.  Currently doing less.
+void
+compute_proofs(srp_ctx *ctx) {
+  int      error;
+  uint32_t be_len = htonl(ctx->namelen);
+  
+  sha512_update(&ctx->hctx, H_N.bytes, sizeof(H_N), &error);
+  sha512_update(&ctx->hctx, (const uint8_t *)&be_len, sizeof(be_len), &error);
+  sha512_update(&ctx->hctx, ctx->username, ctx->namelen, &error);
+  sha512_update(&ctx->hctx, ctx->keymatter.bytes, sizeof(ctx->keymatter), &error);
+  sha512_final (&ctx->hctx, &ctx->proof1, &error);
+  sha512_update(&ctx->hctx, ctx->proof1.bytes, sizeof(&ctx->proof1), &error);
+  sha512_update(&ctx->hctx, ctx->keymatter.bytes
+		, sizeof(ctx->keymatter), &error);
+  sha512_final (&ctx->hctx, &ctx->proof2, &error);
+}
+
+void
+srp_party_2_step_1(srp_ctx *ctx) {
+  char   tmp1[1024], tmp2[1024];
+  size_t size = 0;
+
+  //printf("A(2): ");
+  //internal_print_bignum(&ctx->A);
+  // TODO: handle this gracefully.
+  srp_compute_B(ctx);
+  srp_compute_u(ctx);
+  //printf("u(2):");
+  //internal_print_bignum(&ctx->u);
+  srp_party_2_compute_S(ctx);
+
+  if (mp_to_radix(&ctx->B, tmp2, 1024, &size, 10) != MP_OKAY) { exit(-1); }
+  printf("Server computed S:");
+  internal_print_bignum(&ctx->S);
+  printf("\n");
+  if (!srp_check_party_1_params(ctx)) { return; }
+  compute_key_material(ctx);
+  compute_proofs(ctx);
+}
+
+void
+srp_party_1_step_2(srp_ctx *ctx, uint8_t *pw, uint32_t pwlen) {
+  //printf("B(1): ");
+  //internal_print_bignum(&ctx->B);
+  srp_compute_u(ctx);
+  //printf("u(1):");
+  //internal_print_bignum(&ctx->u);
+  srp_compute_x(ctx, pw, pwlen);
+  //printf("x(1): ");
+  //internal_print_bignum(&ctx->x);
+  srp_party_1_compute_S(ctx);
+  printf("Client computed S:");
+  internal_print_bignum(&ctx->S);
+  printf("\n");
+  if (!srp_check_party_2_params(ctx)) { return; }
+  compute_key_material(ctx);
+  compute_proofs(ctx);
+}
+
+bool
+srp_party_2_step_2(srp_ctx *ctx, sha512_tag *received_proof) {
+  if (memcmp(&ctx->proof1, received_proof, sizeof(sha512_tag))) {
+    return false;
+  }
+  return true;
+}
+
+bool
+srp_party_1_step_3(srp_ctx *ctx, sha512_tag *received_proof) {
+  if (memcmp(&ctx->proof2, received_proof, sizeof(sha512_tag))) {
+    return false;
+  }
+  return true;
+}
+
+#ifdef TEST_SRP
 //  mp_to_decimal(&res, buf, 1024);
 //  mp_to_hex(&res, buf2, 1024);
 //  err = mp_prime_is_prime(&res, 8, &result);
 
 int main(int argc, char **argv) {
-  //srp_init();  
-}
+  srp_ctx client_ctx, server_ctx;
+  char *pw = "testpw";
 
+  srp_init(&client_ctx);
+  srp_init(&server_ctx);
+  client_ctx.username = (uint8_t *)"test";
+  client_ctx.namelen  = strlen((char *)client_ctx.username);
+  server_ctx.salt     = (uint8_t *)"testsalt";
+  server_ctx.saltlen  = strlen((char *)server_ctx.salt);
+
+  srp_compute_v(&server_ctx, (uint8_t *)pw, strlen(pw));
+  srp_party_1_step_1(&client_ctx);
+  // User -> Host: username, A
+  server_ctx.username = client_ctx.username;
+  server_ctx.namelen  = client_ctx.namelen;
+  memcpy((void *)&(server_ctx.A), &(client_ctx.A), sizeof(client_ctx.A));
+  srp_party_2_step_1(&server_ctx);
+  
+  // Host -> User: s, B
+  client_ctx.salt     = server_ctx.salt;
+  client_ctx.saltlen  = server_ctx.saltlen;
+  memcpy((void *)&(client_ctx.B), &(server_ctx.B), sizeof(server_ctx.B));  
+  srp_party_1_step_2(&client_ctx, (uint8_t *)pw, strlen(pw));
+
+
+  if (!srp_party_2_step_2(&server_ctx, &client_ctx.proof1)) {
+    printf("Proof failed.\n");
+  } else {
+    printf("Done!\n");
+  }
+}
+#endif
