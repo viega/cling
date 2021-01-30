@@ -1,8 +1,37 @@
-#include "libtommath/tommath.h"
 #include <stdlib.h>
 #include <sys/random.h>
 
-#include "sha512.h"
+#include "srp.h"
+
+
+static unsigned char trans[256] = {
+  '.', '.', '.', '.', '.', '.', '.', '.', '.', '.',
+  '.', '.', '.', '.', '.', '.', '.', '.', '.', '.',
+  '.', '.', '.', '.', '.', '.', '.', '.', '.', '.',
+  '.', '.', '.', '!', '"', '#', '$', '%', '&', '\'',
+  '(', ')', '*', '+', ',', '-', '.', '/', '0', '1',
+  '2', '3', '4', '5', '6', '7', '8', '9', ':', ';',
+  '<', '=', '>', '?', '@', 'A', 'B', 'C', 'D', 'E',
+  'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O',
+  'P', 'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y',
+  'Z', '[', '\\', ']', '^', '_', '`', 'a', 'b', 'c',
+  'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm',
+  'n', 'o', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w',
+  'x', 'y', 'z', '{', '|', '}', '~', '.', '.', '.',
+  '.', '.', '.', '.', '.', '.', '.', '.', '.', '.',
+  '.', '.', '.', '.', '.', '.', '.', '.', '.', '.',
+  '.', '.', '.', '.', '.', '.', '.', '.', '.', '.',
+  '.', '.', '.', '.', '.', '.', '.', '.', '.', '.',
+  '.', '.', '.', '.', '.', '.', '.', '.', '.', '.',
+  '.', '.', '.', '.', '.', '.', '.', '.', '.', '.',
+  '.', '.', '.', '.', '.', '.', '.', '.', '.', '.',
+  '.', '.', '.', '.', '.', '.', '.', '.', '.', '.',
+  '.', '.', '.', '.', '.', '.', '.', '.', '.', '.',
+  '.', '.', '.', '.', '.', '.', '.', '.', '.', '.',
+  '.', '.', '.', '.', '.', '.', '.', '.', '.', '.',
+  '.', '.', '.', '.', '.', '.', '.', '.', '.', '.',
+  '.', '.', '.', '.', '.', '.'
+};
 
 // This is an implementation of SRP-6a, which is now in the public domain.
 
@@ -67,39 +96,75 @@ static mp_int     mp_nil; // Used to test if A should be accepted.
 static sha512_tag H_N;  
 static bool       inited = false;
 
-typedef struct {
-  // We put pointers to the static value just to make the code a bit more clear (for me at least).
-  mp_int    *N_ptr; // Our large public safe prime (above).
-  mp_int    *g_ptr; // 2.
-  mp_int    *k_ptr; // A multiplier parameter: H(N,g)
-  mp_int    *Zero_ptr; // A pointer to zero.
-  mp_int     u; // Random scrambling parameter;
-  mp_int     a; // Secret ephemeral value used to compute A
-  mp_int     b; // Secret ephemeral value used to compute B
-  mp_int     A; // The public ephemeral value sent by party 1 (the initiator)
-  mp_int     B; // The public ephemeral value sent by party 2
-  mp_int     x; // The private key.
-  mp_int     v; // Password verifier.
-  mp_int     S; // The session key, prior to applying our hash function
-  uint8_t   *salt; // A (public) salt value.
-  uint8_t   *username;
-  uint32_t   saltlen;
-  uint32_t   namelen;
-  sha512_ctx hctx;
-  sha512_tag keymatter;
-  sha512_tag proof1;
-  sha512_tag proof2;
-} srp_ctx;
 
-static void
-internal_print_bignum(mp_int *n) {
+char *
+build_hex_dump(unsigned char *bytes, uint32_t len) {
+  char     *ret, *p;
+  char      buf[21] = {0,};
+  u_int32_t i, j, n;
+
+// Estimate that each byte takes 10 chars to represent for now.  Come back and do the math.
+  ret = (char *)malloc(100 * len);
+  p   = ret;
+
+  for (i=j=0; i<len; i++) {
+    if (i && !(i%4)) {
+      if (!(i%16)) {
+        n = sprintf(p, "    %s (0x%04x-0x%04x)\n      ",
+                    buf,
+                    (unsigned int)(i-16),
+                    (unsigned int)(i-1));
+        p += n;
+        memset (buf, 0, 20);
+        j = 0;
+      } else {
+        n = sprintf(p, " ");
+        p += n;
+        buf[j++] = ' ';
+      }
+    }
+    buf[j++] = trans[(int)(*bytes)];
+    n = sprintf(p, "%02x", *bytes++);
+    p += n;
+  }
+  j = i;
+
+  while (j % 16) {
+    n = sprintf(p, "  ");
+    p += n;
+    if (!(j%4)) {
+      n = sprintf (p, " ");
+      p += n;
+    }
+    j++;
+  }
+  n = sprintf(p, "    %s", buf);
+  p += n;
+  j = i;
+  while (j % 16) {
+    n = sprintf(p, " ");
+    p += n;
+    if (!(j%4)) {
+      n = sprintf(p, " ");
+      p += n;
+    }
+    j++;
+  }
+  n = sprintf(p, " (0x%04x-0x%04x)\n", (unsigned char)(((i-1)/16)*16), i-1);
+  p += n;
+  *p = 0;
+  return ret;
+}
+
+void
+print_bignum(mp_int *n) {
   size_t size, written;
   char  *s;
 
-  if (mp_radix_size(n, 10, &size) != MP_OKAY) { exit(-1); }
+  if (mp_radix_size(n, 10, &size) != MP_OKAY) { printf("1\n"); exit(-1); }
   s = (char *)malloc(size);
 
-  if (mp_to_radix(n, s, size, &written, 10) != MP_OKAY) { exit(-1); }
+  if (mp_to_radix(n, s, size, &written, 10) != MP_OKAY) { printf("2\n"); exit(-1); }
 
   printf("%s", s);
   free(s);
@@ -119,9 +184,10 @@ srp_compute_k(srp_ctx *ctx) {
   sha512_update(&ctx->hctx, &g, sizeof(1), &error);
   sha512_final (&ctx->hctx, &tag, &error);
   if (mp_from_ubin(&mp_k, (const uint8_t *)&tag.bytes, SHA512_TAG_LENGTH) != MP_OKAY) {
+    printf("3\n");
     exit(-1);
   }
-  if (mp_mod(&mp_k, &mp_N, &mp_k) != MP_OKAY) { exit(-1); }
+  if (mp_mod(&mp_k, &mp_N, &mp_k) != MP_OKAY) {     printf("4\n");exit(-1); }
 }
 
 void
@@ -130,12 +196,12 @@ srp_init(srp_ctx *ctx) {
   
   sha512_initialize(&ctx->hctx);
   if (!inited) {
-    if (mp_init(&mp_N)    != MP_OKAY)                 { exit(-1); }
-    if (mp_init(&mp_nil)  != MP_OKAY)                 { exit(-1); }
-    if (mp_init(&mp_g)    != MP_OKAY)                 { exit(-1); }
-    if (mp_from_ubin(&mp_N, N, sizeof(N)) != MP_OKAY) { exit(-1); }
+    if (mp_init(&mp_N)    != MP_OKAY)                 { printf("5\n"); exit(-1); }
+    if (mp_init(&mp_nil)  != MP_OKAY)                 { printf("6\n"); exit(-1); }
+    if (mp_init(&mp_g)    != MP_OKAY)                 { printf("7\n"); exit(-1); }
+    if (mp_from_ubin(&mp_N, N, sizeof(N)) != MP_OKAY) { printf("8\n"); exit(-1); }
     mp_set(&mp_nil, 0);
-    mp_set(&mp_g,    2);
+    mp_set(&mp_g,   2);
     srp_compute_k(ctx);
     // Not quite following the suggested proof here.  The one they
     // provide is overkill anyway.
@@ -170,26 +236,27 @@ srp_compute_x(srp_ctx *ctx, uint8_t *pw, uint32_t pwlen) {
   sha512_update     (&ctx->hctx, pw, pwlen, &error);
   sha512_final      (&ctx->hctx, &tag, &error);
   if (mp_from_ubin(&ctx->x, (const uint8_t *)&tag.bytes, SHA512_TAG_LENGTH) != MP_OKAY) {
+    printf("11\n");
     exit(-1);
   }
-  if (mp_mod(&ctx->x, ctx->N_ptr, &ctx->x) != MP_OKAY) { exit(-1); }
+  if (mp_mod(&ctx->x, ctx->N_ptr, &ctx->x) != MP_OKAY) { printf("12\n"); exit(-1); }
 }
 
 void
 srp_compute_v(srp_ctx *ctx, uint8_t *pw, uint32_t pwlen) {
   // v = g^x mod N
   //printf("g(2): ");
-  //internal_print_bignum(ctx->g_ptr);
+  //print_bignum(ctx->g_ptr);
   // printf("N(2): ");
-  //internal_print_bignum(ctx->N_ptr);
+  //print_bignum(ctx->N_ptr);
   //printf("salt(2): %s\n", (char *)ctx->salt);
   //printf("pw(2): %s\n", (char *)pw);
   srp_compute_x(ctx, pw, pwlen);
   //printf("x(2): ");
-  //internal_print_bignum(&ctx->x);
-  if (mp_exptmod(ctx->g_ptr, &ctx->x, &mp_N, &ctx->v) != MP_OKAY) { exit(-1); }
+  //print_bignum(&ctx->x);
+  if (mp_exptmod(ctx->g_ptr, &ctx->x, &mp_N, &ctx->v) != MP_OKAY) { printf("13\n"); exit(-1); }
   //printf("v(2): ");
-  //internal_print_bignum(&ctx->v);
+  //print_bignum(&ctx->v);
 }
 
 void
@@ -197,9 +264,11 @@ srp_select_random(srp_ctx *ctx, mp_int *out) {
   uint8_t randbytes[SRP_PRIME_SIZE/8];
 
   if (getrandom(randbytes, SRP_PRIME_SIZE/8, 0) != SRP_PRIME_SIZE/8) {
+    printf("14\n");
     exit(-1);
   }
   if (mp_from_ubin(out, randbytes, SRP_PRIME_SIZE/8) != MP_OKAY) {
+    printf("15\n");
     exit(-1);
   }
 }
@@ -207,17 +276,17 @@ srp_select_random(srp_ctx *ctx, mp_int *out) {
 static void
 srp_compute_A(srp_ctx *ctx) {
   srp_select_random(ctx, &ctx->a);
-  if (mp_mod(&ctx->a, ctx->N_ptr, &ctx->a) != MP_OKAY) { exit(-1); }
+  if (mp_mod(&ctx->a, ctx->N_ptr, &ctx->a) != MP_OKAY) { printf("16\n"); exit(-1); }
   // A = g^a mod N
-  if (mp_exptmod(ctx->g_ptr, &ctx->a, ctx->N_ptr, &ctx->A) != MP_OKAY) { exit(-1); }
+  if (mp_exptmod(ctx->g_ptr, &ctx->a, ctx->N_ptr, &ctx->A) != MP_OKAY) { printf("17\n"); exit(-1); }
   //printf("g(1): ");
-  //internal_print_bignum(ctx->g_ptr);
+  //print_bignum(ctx->g_ptr);
   //printf("a(1): ");
-  //internal_print_bignum(&ctx->a);
+  //print_bignum(&ctx->a);
   //printf("N(1): ");
-  //internal_print_bignum(ctx->N_ptr);
+  //print_bignum(ctx->N_ptr);
   //printf("A(1): ");
-  //internal_print_bignum(&ctx->A);
+  //print_bignum(&ctx->A);
 }
 
 void
@@ -226,34 +295,37 @@ srp_compute_B(srp_ctx *ctx) {
   mp_int expr1; // kv
   mp_int expr2; // g^b
   
-  if (mp_init(&expr1) != MP_OKAY)   { exit(-1); }
-  if (mp_init(&expr2) != MP_OKAY)   { exit(-1); }
+  if (mp_init(&expr1) != MP_OKAY)   { printf("18\n"); exit(-1); }
+  if (mp_init(&expr2) != MP_OKAY)   { printf("19\n"); exit(-1); }
 
   srp_select_random(ctx, &ctx->b);
-  if (mp_mod(&ctx->b, ctx->N_ptr, &ctx->b) != MP_OKAY) { exit(-1); }  
+  if (mp_mod(&ctx->b, ctx->N_ptr, &ctx->b) != MP_OKAY) { printf("20\n"); exit(-1); }  
   
   if (mp_mulmod(ctx->k_ptr, &ctx->v, ctx->N_ptr, &expr1) != MP_OKAY) {
+    printf("21\n");
     exit(-1);
   }
   if (mp_exptmod(ctx->g_ptr, &ctx->b, ctx->N_ptr, &expr2) != MP_OKAY) {
+    printf("22\n");    
     exit(-1);
   }
   if (mp_addmod(&expr1, &expr2, ctx->N_ptr, &ctx->B)  != MP_OKAY) {
+    printf("23\n");    
     exit(-1);    
   }
   mp_clear(&expr1);
   mp_clear(&expr2);
 
   //printf("k(2): ");
-  //internal_print_bignum(ctx->k_ptr);
+  //print_bignum(ctx->k_ptr);
   //printf("v(2): ");
-  //internal_print_bignum(&ctx->v);
+  //print_bignum(&ctx->v);
   //printf("g(2): ");
-  //internal_print_bignum(ctx->g_ptr);
+  //print_bignum(ctx->g_ptr);
   //printf("b(2): ");
-  //internal_print_bignum(&ctx->b);
+  //print_bignum(&ctx->b);
   //printf("B(2): ");
-  //internal_print_bignum(&ctx->B);
+  //print_bignum(&ctx->B);
 }
 
 void
@@ -262,20 +334,25 @@ srp_compute_u(srp_ctx *ctx) {
   uint8_t    buf[2*SRP_PRIME_SIZE/8] = {0,};
   size_t     outlen;
   int        error;
+  mp_err     code;
 
-  if (mp_to_ubin(&ctx->A, buf, SRP_PRIME_SIZE/8, &outlen) != MP_OKAY) {
+  if ((code = mp_to_ubin(&ctx->A, buf, SRP_PRIME_SIZE/8, &outlen)) != MP_OKAY) {
+    printf("24\n");
+    printf("%s\n", mp_error_to_string(code));
     exit(-1);
   }
   if (mp_to_ubin(&ctx->B, buf+(SRP_PRIME_SIZE/8), SRP_PRIME_SIZE/8, &outlen) !=
       MP_OKAY) {
+    printf("25\n");    
     exit(-1);
   }
   // TODO: do something w/ error value.
   sha512(&ctx->hctx, buf, sizeof(buf), &tag, &error);
   if (mp_from_ubin(&ctx->u, (const uint8_t *)&tag.bytes, SHA512_TAG_LENGTH) != MP_OKAY) {
+    printf("26\n");    
     exit(-1);
   }
-  if (mp_mod(&ctx->u, ctx->N_ptr, &ctx->u) != MP_OKAY) { exit(-1); }
+  if (mp_mod(&ctx->u, ctx->N_ptr, &ctx->u) != MP_OKAY) {     printf("27\n");exit(-1); }
 }
 
 // TODO: should be able to operate on expressions in-place,
@@ -292,20 +369,22 @@ srp_party_1_compute_S(srp_ctx *ctx) {
 
   //printf("s1(B,k,g,x,a,u,N)...\n");
   //printf("s1(");
-  //internal_print_bignum(&ctx->B);
+  //print_bignum(&ctx->B);
   //printf(",");
-  //internal_print_bignum(ctx->k_ptr);
+  //print_bignum(ctx->k_ptr);
   //printf(",");
-  //internal_print_bignum(ctx->g_ptr);
+  //print_bignum(ctx->g_ptr);
   //printf(", ");
-  //internal_print_bignum(&ctx->x);
+  //print_bignum(&ctx->x);
   //printf(", ");
-  //internal_print_bignum(&ctx->a);
+  //print_bignum(&ctx->a);
   //printf(", ");
-  //internal_print_bignum(&ctx->u);
+  //print_bignum(&ctx->u);
   //printf(", ");
-  //internal_print_bignum(ctx->N_ptr);
+  //print_bignum(ctx->N_ptr);
   //printf(")\n");
+
+  printf("Do I get through here?\n");
   if (mp_init(&expr1) != MP_OKAY) { exit(-1); }    
   if (mp_init(&expr2) != MP_OKAY) { exit(-1); }
   if (mp_init(&expr3) != MP_OKAY) { exit(-1); }  
@@ -318,6 +397,7 @@ srp_party_1_compute_S(srp_ctx *ctx) {
   if (mp_mul(&ctx->u, &ctx->x, &expr4) != MP_OKAY)     { exit(-1); }
   if (mp_add(&ctx->a, &expr4, &expr5)  != MP_OKAY)     { exit(-1); }
   if (mp_exptmod(&expr3, &expr5, ctx->N_ptr, &ctx->S) != MP_OKAY) { exit(-1); }
+  printf("Yes.\n");
   
   mp_clear(&expr1);
   mp_clear(&expr2);
@@ -325,7 +405,7 @@ srp_party_1_compute_S(srp_ctx *ctx) {
   mp_clear(&expr4);
   mp_clear(&expr5);
   //printf("S ?= ");
-  //internal_print_bignum(&ctx->S);
+  //print_bignum(&ctx->S);
   //printf("\n");
 }
 
@@ -337,23 +417,25 @@ srp_party_2_compute_S(srp_ctx *ctx) {
 
   //printf("s2(A, v, u, b, N)\n");
   //printf("s2(");
-  //internal_print_bignum(&ctx->A);
+  //print_bignum(&ctx->A);
   //printf(",");
-  //internal_print_bignum(&ctx->v);
+  //print_bignum(&ctx->v);
   //printf(",");
-  //internal_print_bignum(&ctx->u);
+  //print_bignum(&ctx->u);
   //printf(",");
-  //internal_print_bignum(&ctx->b);
+  //print_bignum(&ctx->b);
   //printf(",");
-  //internal_print_bignum(ctx->N_ptr);
+  //print_bignum(ctx->N_ptr);
   //printf(")\n");
-  
+
+  printf("Do I get through here?\n");
   if (mp_init(&expr1) != MP_OKAY)      { exit(-1); }
   if (mp_init(&expr2) != MP_OKAY)      { exit(-1); }
 
   if (mp_exptmod(&ctx->v, &ctx->u, ctx->N_ptr, &expr1) != MP_OKAY) { exit(-1); }
   if (mp_mulmod(&expr1, &ctx->A, ctx->N_ptr, &expr2)   != MP_OKAY) { exit(-1); }
   if (mp_exptmod(&expr2, &ctx->b, ctx->N_ptr, &ctx->S) != MP_OKAY) { exit(-1); }
+  printf("Yes.\n");
 
     // Old and busted
   //if (mp_mulmod(&ctx->A, &ctx->v, ctx->N_ptr, &expr1) != MP_OKAY) { exit(-1); }
@@ -363,7 +445,7 @@ srp_party_2_compute_S(srp_ctx *ctx) {
   mp_clear(&expr1);
   mp_clear(&expr2);
   //printf("S ?= ");
-  //internal_print_bignum(&ctx->S);
+  //print_bignum(&ctx->S);
   //printf("\n");
 }
 
@@ -378,8 +460,8 @@ srp_check_party_1_params(srp_ctx *ctx) {
   mp_int tmp;
   bool   ret = true;
 
-  if (mp_init(&tmp) != MP_OKAY)                { exit(-1); }
-  if (mp_mod(&ctx->A, ctx->N_ptr, &tmp) != MP_OKAY) { exit(-1); }
+  if (mp_init(&tmp) != MP_OKAY)                { printf("a\n"); exit(-1); }
+  if (mp_mod(&ctx->A, ctx->N_ptr, &tmp) != MP_OKAY) { printf("b\n"); exit(-1); }
   if (mp_cmp_mag(&tmp, ctx->Zero_ptr) == MP_EQ) {
     ret = false;
   }
@@ -394,8 +476,8 @@ srp_check_party_2_params(srp_ctx *ctx) {
   mp_int tmp;
   bool   ret = true;
 
-  if (mp_init(&tmp) != MP_OKAY)                     { exit(-1); }
-  if (mp_mod(&ctx->B, ctx->N_ptr, &tmp) != MP_OKAY) { exit(-1); }
+  if (mp_init(&tmp) != MP_OKAY)                     { printf("c\n");exit(-1); }
+  if (mp_mod(&ctx->B, ctx->N_ptr, &tmp) != MP_OKAY) { printf("d\n");exit(-1); }
   if (mp_cmp_mag(&tmp, ctx->Zero_ptr) == MP_EQ) {
     ret = false;
   }
@@ -420,7 +502,7 @@ compute_key_material(srp_ctx *ctx) {
   buflen = mp_ubin_size(&ctx->S);
   buf    = (uint8_t *)malloc(buflen);
   
-  if (mp_to_ubin(&ctx->S, buf, buflen, &outlen) != MP_OKAY) { exit(-1); }
+  if (mp_to_ubin(&ctx->S, buf, buflen, &outlen) != MP_OKAY) {printf("e\n"); exit(-1); }
   sha512_update(&ctx->hctx, buf, outlen, &error);
   sha512_final (&ctx->hctx, &ctx->keymatter, &error);
   free(buf);
@@ -445,23 +527,19 @@ compute_proofs(srp_ctx *ctx) {
 
 void
 srp_party_2_step_1(srp_ctx *ctx) {
-  char   tmp1[1024], tmp2[1024];
-  size_t size = 0;
-
   //printf("A(2): ");
-  //internal_print_bignum(&ctx->A);
+  //print_bignum(&ctx->A);
   // TODO: handle this gracefully.
   srp_compute_B(ctx);
   srp_compute_u(ctx);
   //printf("u(2):");
-  //internal_print_bignum(&ctx->u);
+  //print_bignum(&ctx->u);
   srp_party_2_compute_S(ctx);
 
-  if (mp_to_radix(&ctx->B, tmp2, 1024, &size, 10) != MP_OKAY) { exit(-1); }
   printf("Server computed S:");
-  internal_print_bignum(&ctx->S);
+  print_bignum(&ctx->S);
   printf("\n");
-  if (!srp_check_party_1_params(ctx)) { return; }
+  if (!srp_check_party_1_params(ctx)) { printf("Fuck.\n"); return; }
   compute_key_material(ctx);
   compute_proofs(ctx);
 }
@@ -469,17 +547,17 @@ srp_party_2_step_1(srp_ctx *ctx) {
 void
 srp_party_1_step_2(srp_ctx *ctx, uint8_t *pw, uint32_t pwlen) {
   //printf("B(1): ");
-  //internal_print_bignum(&ctx->B);
+  //print_bignum(&ctx->B);
   srp_compute_u(ctx);
   //printf("u(1):");
-  //internal_print_bignum(&ctx->u);
+  //print_bignum(&ctx->u);
   srp_compute_x(ctx, pw, pwlen);
   //printf("x(1): ");
-  //internal_print_bignum(&ctx->x);
+  //print_bignum(&ctx->x);
   srp_party_1_compute_S(ctx);
-  printf("Client computed S:");
-  internal_print_bignum(&ctx->S);
-  printf("\n");
+  //printf("Client computed S:");
+  //print_bignum(&ctx->S);
+  //printf("\n");
   if (!srp_check_party_2_params(ctx)) { return; }
   compute_key_material(ctx);
   compute_proofs(ctx);
