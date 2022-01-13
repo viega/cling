@@ -17,17 +17,16 @@
 #define SHA512_TAG_LENGTH 64
 
 typedef struct {
-  int listen_fd;
-  int fd;
+    int listen_fd;
+    int fd;
 } sha512_ctx;
 
 typedef struct {
-  uint8_t bytes[SHA512_TAG_LENGTH];
+    uint8_t bytes[SHA512_TAG_LENGTH];
 } sha512_tag;
 
 bool sha512_initialize(sha512_ctx *);
-bool sha512_update    (sha512_ctx *, const uint8_t *, size_t, int *);
-bool sha512_final     (sha512_ctx *, sha512_tag *, int *);
-bool sha512           (sha512_ctx *, const uint8_t *, size_t,
-		       sha512_tag *, int *);
+bool sha512_update(sha512_ctx *, const uint8_t *, size_t, int *);
+bool sha512_final(sha512_ctx *, sha512_tag *, int *);
+bool sha512(sha512_ctx *, const uint8_t *, size_t, sha512_tag *, int *);
 #endif

@@ -20,24 +20,24 @@
 // The authentication tag size can theoretically be shortened, but
 // this has an outsized impact on the forgeability of messages, so
 // leave at 16.
-#define GCM_TAG_LEN  16
+#define GCM_TAG_LEN 16
 // 12 bytes is, by far, the most efficient length for a GCM
 // initialization vector.  Keeping it this size avoids paying the
 // price of hashing the IV.
-#define GCM_IV_LEN   12
+#define GCM_IV_LEN  12
 // We are going ahead and using AES-256 for all sessions.  That is, 32
 // byte (256 bit) keys.  128 bits is generally considered "enough" but
 // the prevalance of hardware acceleration is such that we don't
 // recommend smaller keys.  If we add future flexibility, this is the
 // only parameter that we'd consider changing.
-#define AES_KEYLEN   32
+#define AES_KEYLEN  32
 
 // In this library, when we initialize a GCM context, we must indicate
 // whether we are the client or the server.  We maintain separate
 // nonce spaces for the two sides, so that messages don't have to be
 // sent in lockstep.
-#define ROLE_CLIENT  0
-#define ROLE_SERVER  1
+#define ROLE_CLIENT 0
+#define ROLE_SERVER 1
 
 // This value specifies the total number of messages either side of
 // the connection will allow to be sent, before terminating.  Note
@@ -60,9 +60,9 @@
 // bytes 9-11: The 24-bit message counter.
 
 // Indexing into a 32-bit array, which word contains the appropriate value?
-#define GCM_HPT_IX      0
-#define GCM_PID_IX      1
-#define GCM_MSG_CTR_IX  2
+#define GCM_HPT_IX     0
+#define GCM_PID_IX     1
+#define GCM_MSG_CTR_IX 2
 
 // The message counter is stored in a 32 bit word, but is only
 // a 24-bit value.  The rest of the word/half word is reserved for
@@ -79,31 +79,31 @@
 
 // The most significant bit is on when the server-side originates
 // a message, and off when it's the client.
-#define F_SERVER_ORIGIN  0x80000000
-#define F_CLIENT_ORIGIN  0x00000000
+#define F_SERVER_ORIGIN 0x80000000
+#define F_CLIENT_ORIGIN 0x00000000
 // This flag may be used to help negotiate retransmissions
 // when I get that far.  It's just a placeholder at the moment.
-#define F_CONTROL_MSG    0x40000000
-// Right now, F_CTR_OVERFLOW is also unused; instead, the check 
+#define F_CONTROL_MSG   0x40000000
+// Right now, F_CTR_OVERFLOW is also unused; instead, the check
 // is on a comparison against MAX_MESSAGES.
-#define F_CTR_OVERFLOW   0x01000000
+#define F_CTR_OVERFLOW  0x01000000
 // When treating the lower 32 bits of the IV as an int, this
 // removes the flags, and gives us just the counter.
-#define MASK_CTR         0x00ffffff
+#define MASK_CTR        0x00ffffff
 // Masks out the lower 32 bits of an 64-bit int, which we use
 // when getting clock data.
-#define MASK_LOWER_32    ((uint64_t)0xffffffff)
+#define MASK_LOWER_32   ((uint64_t)0xffffffff)
 
-#define ERR_DECRYPT_FAIL  EBADMSG        // Proxy'd from kernel
-#define ERR_ENCRYPT_LIMIT ECONNABORTED   // Piggybacking on code
-#define ERR_BAD_PLAINTEXT EINVAL         // Piggybacking on code
-#define ERR_BAD_ORIGIN    EPROTO         // Piggybacking on code
+#define ERR_DECRYPT_FAIL  EBADMSG      // Proxy'd from kernel
+#define ERR_ENCRYPT_LIMIT ECONNABORTED // Piggybacking on code
+#define ERR_BAD_PLAINTEXT EINVAL       // Piggybacking on code
+#define ERR_BAD_ORIGIN    EPROTO       // Piggybacking on code
 
 // For our perposes, AES keys really only need to be an array of
 // bytes.  We use a fixed-size key, so don't even need to keep
 // track of the key size.
 typedef struct {
-  uint8_t key[AES_KEYLEN];
+    uint8_t key[AES_KEYLEN];
 } aes_key_t;
 
 // Note that nonces are stored in network byte order, so when we pull
@@ -113,11 +113,11 @@ typedef struct {
 // we lay it out this way to make it easier for us to operate on the
 // nonce in different ways depending on our needs.
 typedef struct {
-  uint32_t   ivlen;
-  union {
-    uint32_t ints [3];
-    uint8_t  bytes[12];
-  } u;
+    uint32_t ivlen;
+    union {
+        uint32_t ints[3];
+        uint8_t  bytes[12];
+    } u;
 } gcm_iv_t;
 
 // These macros assume you're operating on an object of type
@@ -146,12 +146,12 @@ typedef struct {
 // startup).
 
 typedef struct {
-  int       listen_fd;
-  int       fd;
-  gcm_iv_t  encr_iv; // IV for encrypting messages.
-  gcm_iv_t  decr_iv; // IV for decrypting messages.
-  bool      encrypt_limit;
-  uint32_t  origin_bit;
+    int      listen_fd;
+    int      fd;
+    gcm_iv_t encr_iv; // IV for encrypting messages.
+    gcm_iv_t decr_iv; // IV for decrypting messages.
+    bool     encrypt_limit;
+    uint32_t origin_bit;
 } gcm_ctx;
 
 // The gcm_str data type is used to hold plaintext and ciphertext
@@ -159,34 +159,34 @@ typedef struct {
 // only use the APIs for accessing these, to avoid any kind of memory
 // error.
 typedef struct {
-  // The first fields are internal accounting.
-  // Note that the total length of the input payload 
-  // should be aad_length + msg_length,
-  // and the total length of the output payload
-  // should be msg_length + tag_length.
-  
-  uint32_t msg_length;  // length of the plaintext/ciphertext.
-  uint32_t tag_length;  // Either 16 or 0; 16 if it's ct, 0 if it's plaintext.
-  gcm_iv_t iv;          // Initialization Vector used for this message.
-  uint32_t aad_length;
-  // When accessing a message, we should be able to address the pt and ct
-  // By requesting them, and we also need to know which iovec is the input
-  // and output.   So for convenience, store the two vectors in two different
-  // sets of points.
-  struct   iovec *in_iov;
-  struct   iovec *out_iov;
-  struct   iovec *pt_iov;
-  struct   iovec *ct_iov;
-  // For input to an operation, the kernel can gather strings that are
-  // scattered around memory.  Each iovec holds a pointer to a string
-  // (along w/ an indication of size), and in_iov is actually a pointer
-  // to an ARRAY of struct iovec objects.  The iov_count field specifies
-  // how many items are in the in_iov array.  
-  uint32_t iov_count;
-  uint8_t  payload[0];
+    // The first fields are internal accounting.
+    // Note that the total length of the input payload
+    // should be aad_length + msg_length,
+    // and the total length of the output payload
+    // should be msg_length + tag_length.
+
+    uint32_t msg_length; // length of the plaintext/ciphertext.
+    uint32_t tag_length; // Either 16 or 0; 16 if it's ct, 0 if it's plaintext.
+    gcm_iv_t iv;         // Initialization Vector used for this message.
+    uint32_t aad_length;
+    // When accessing a message, we should be able to address the pt and ct
+    // By requesting them, and we also need to know which iovec is the input
+    // and output.   So for convenience, store the two vectors in two different
+    // sets of points.
+    struct iovec *in_iov;
+    struct iovec *out_iov;
+    struct iovec *pt_iov;
+    struct iovec *ct_iov;
+    // For input to an operation, the kernel can gather strings that are
+    // scattered around memory.  Each iovec holds a pointer to a string
+    // (along w/ an indication of size), and in_iov is actually a pointer
+    // to an ARRAY of struct iovec objects.  The iov_count field specifies
+    // how many items are in the in_iov array.
+    uint32_t      iov_count;
+    uint8_t       payload[0];
 } gcm_str;
 
-bool gcm_initialize (gcm_ctx *, aes_key_t *, int32_t);
-bool gcm_encrypt    (gcm_ctx *, gcm_str *, int *);
-bool gcm_decrypt    (gcm_ctx *, gcm_str *, int *);
+bool gcm_initialize(gcm_ctx *, aes_key_t *, int32_t);
+bool gcm_encrypt(gcm_ctx *, gcm_str *, int *);
+bool gcm_decrypt(gcm_ctx *, gcm_str *, int *);
 #endif
